@@ -1,0 +1,10 @@
+﻿python :   File "<string>", line 6
+위치 C:\Users\tlduf\AppData\Local\Temp\ps-script-1ca4f74a-5e0e-44e2-8f07-cd680df0da11.ps1:88 문자:1
++ python -c "
++ ~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (  File "<string>", line 6:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    print('�??법령?�보 Open API ?�결 ?�스??)
+          ^
+SyntaxError: unterminated string literal (detected at line 6)
