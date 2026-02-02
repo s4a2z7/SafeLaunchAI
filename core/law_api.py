@@ -8,10 +8,23 @@ SafeLaunch AI 프로젝트용 Python 버전
 import requests
 import xmltodict
 import json
+import time
+import logging
 from typing import Optional, Literal
 from dataclasses import dataclass, field
 
 LAW_API_BASE_URL = "https://www.law.go.kr"
+
+# Red Team #9: 재시도 설정
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 2  # 초 (지수 백오프: 2, 4, 8)
+
+logger = logging.getLogger("law_api")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(name)s] %(levelname)s: %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 @dataclass
@@ -44,7 +57,7 @@ class LawApiParams:
 
 def law_api_call(url_path: str, params: LawApiParams, timeout: int = 30) -> dict:
     """
-    법제처 API 요청
+    법제처 API 요청 (Red Team #9: 재시도 + 지수 백오프)
 
     Args:
         url_path: API URL 경로 (예: "/DRF/lawSearch.do")
@@ -53,22 +66,41 @@ def law_api_call(url_path: str, params: LawApiParams, timeout: int = 30) -> dict
 
     Returns:
         dict: 파싱된 응답 (XML→dict 또는 JSON→dict)
+
+    Raises:
+        requests.exceptions.RequestException: MAX_RETRIES 초과 시
     """
     url = LAW_API_BASE_URL + url_path
-    try:
-        response = requests.get(url, params=params.to_dict(), timeout=timeout)
-        response.raise_for_status()
+    last_error: Optional[Exception] = None
 
-        if params.type == "XML":
-            return xmltodict.parse(response.content)
-        elif params.type == "JSON":
-            return response.json()
-        else:
-            return {"html": response.text}
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, params=params.to_dict(), timeout=timeout)
+            response.raise_for_status()
 
-    except requests.exceptions.RequestException as e:
-        print(f"[LawAPI Error] {e}")
-        raise
+            if params.type == "XML":
+                return xmltodict.parse(response.content)
+            elif params.type == "JSON":
+                return response.json()
+            else:
+                return {"html": response.text}
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY_BASE ** attempt
+                logger.warning(
+                    f"API 요청 실패 (시도 {attempt}/{MAX_RETRIES}): {e} "
+                    f"→ {delay}초 후 재시도"
+                )
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"API 요청 최종 실패 ({MAX_RETRIES}회 시도): "
+                    f"url={url_path}, params={params.extra_params}, error={e}"
+                )
+
+    raise last_error  # type: ignore[misc]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -112,10 +144,13 @@ def get_law_detail(law_id: str) -> dict:
 def get_precedent_detail(prec_seq: str) -> dict:
     """
     판례 본문 조회
-    target: prec, precSeq 파라미터로 판례 일련번호 지정
+    target: prec, ID 파라미터로 판례 일련번호 지정
+
+    NOTE: 검색 결과의 '판례상세링크'가 ID 파라미터를 사용하므로
+          precSeq가 아닌 ID로 전달해야 XML 구조화 응답을 받음.
     """
     params = LawApiParams(target="prec")
-    params.add_field("precSeq", prec_seq)
+    params.add_field("ID", prec_seq)
     return law_api_call("/DRF/lawService.do", params)
 
 

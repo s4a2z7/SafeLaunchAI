@@ -17,8 +17,10 @@ import json
 import os
 import re
 import hashlib
+import logging
 import numpy as np
 from typing import Optional
+from datetime import datetime, timezone
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -28,6 +30,16 @@ from core.law_api import (
     get_law_detail,
     get_precedent_detail,
 )
+
+# ─────────────────────────────────────────────────────────────
+# 로깅 설정
+# ─────────────────────────────────────────────────────────────
+logger = logging.getLogger("legal_rag")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(name)s] %(levelname)s: %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -41,6 +53,37 @@ COLLECTION_PRECEDENTS = "precedents"
 COLLECTION_POLICIES = "store_policies"
 
 ALL_COLLECTIONS = [COLLECTION_LAWS, COLLECTION_PRECEDENTS, COLLECTION_POLICIES]
+
+# 노이즈 감지용 패턴 (Red Team #1, #4)
+NOISE_PATTERNS = re.compile(
+    r"/DRF/|"
+    r"\.css\b|"
+    r"\.js\b|"
+    r"\.jpg\b|"
+    r"\.png\b|"
+    r"\.gif\b|"
+    r"font-family:|"
+    r"font-size:|"
+    r"text-align:|"
+    r"margin-top:|"
+    r"padding:|"
+    r"background-color:|"
+    r"border:|"
+    r"<script|"
+    r"<style|"
+    r"jquery|"
+    r"ext-all|"
+    r"resources/css",
+    re.IGNORECASE,
+)
+
+# 법률 문서 최소 유효성 키워드
+LEGAL_KEYWORDS_LAW = ["제", "조", "항", "호", "법", "규정", "시행"]
+LEGAL_KEYWORDS_PRECEDENT = [
+    "판시사항", "판결요지", "판례", "원고", "피고", "법원", "선고",
+    "판결", "사건", "청구", "항소", "상고", "위반", "침해",
+]
+LEGAL_KEYWORDS_POLICY = ["앱", "정책", "가이드", "심사", "콘텐츠", "데이터", "사용자"]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -98,7 +141,10 @@ class VectorStore:
         n_results: int = 5,
     ) -> list[dict]:
         """
-        TF-IDF 코사인 유사도 기반 검색
+        TF-IDF 코사인 유사도 기반 하이브리드 검색 (Red Team #5 개선)
+
+        char_wb + word 두 벡터라이저의 점수를 가중 합산하여
+        문자 매칭과 단어 매칭을 동시에 활용합니다.
 
         Returns:
             [{"text": str, "metadata": dict, "score": float}, ...]
@@ -110,21 +156,38 @@ class VectorStore:
         doc_ids = list(self._docs.keys())
         doc_texts = [self._docs[d]["text"] for d in doc_ids]
 
-        # TF-IDF 벡터라이저 (한글 1~3글자 단위 + 공백 토큰)
-        vectorizer = TfidfVectorizer(
+        # 1) 문자 단위 벡터라이저 (한글 부분 매칭에 강점)
+        char_vectorizer = TfidfVectorizer(
             analyzer="char_wb",
-            ngram_range=(1, 3),
-            max_features=10000,
+            ngram_range=(2, 4),
+            max_features=15000,
+            sublinear_tf=True,
+        )
+
+        # 2) 단어 단위 벡터라이저 (의미 단위 매칭에 강점)
+        word_vectorizer = TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 2),
+            max_features=15000,
+            sublinear_tf=True,
         )
 
         try:
-            tfidf_matrix = vectorizer.fit_transform(doc_texts)
-            query_vec = vectorizer.transform([query_text])
+            char_matrix = char_vectorizer.fit_transform(doc_texts)
+            char_query = char_vectorizer.transform([query_text])
+            char_sim = cosine_similarity(char_query, char_matrix).flatten()
         except ValueError:
-            # 문서가 비어있거나 벡터화 실패
-            return []
+            char_sim = np.zeros(len(doc_ids))
 
-        similarities = cosine_similarity(query_vec, tfidf_matrix).flatten()
+        try:
+            word_matrix = word_vectorizer.fit_transform(doc_texts)
+            word_query = word_vectorizer.transform([query_text])
+            word_sim = cosine_similarity(word_query, word_matrix).flatten()
+        except ValueError:
+            word_sim = np.zeros(len(doc_ids))
+
+        # 하이브리드 점수: 단어 60% + 문자 40%
+        similarities = (word_sim * 0.6) + (char_sim * 0.4)
 
         # 상위 n_results 인덱스 (내림차순)
         top_indices = np.argsort(similarities)[::-1][:n_results]
@@ -167,8 +230,64 @@ def get_or_create_collection(name: str) -> VectorStore:
 # Step 2: 데이터 청킹 (Context-aware Chunking)
 # ─────────────────────────────────────────────────────────────
 
+def _is_noise_text(text: str) -> bool:
+    """CSS/JS/HTML 노이즈 텍스트인지 판별 (Red Team #1, #4)"""
+    if not text or len(text.strip()) < 10:
+        return True
+    # 노이즈 패턴 매칭 횟수가 전체 문장 대비 과다하면 노이즈
+    matches = NOISE_PATTERNS.findall(text)
+    if len(matches) >= 3:
+        return True
+    # 텍스트 대비 경로 구분자(/) 비율이 높으면 노이즈
+    slash_ratio = text.count("/") / max(len(text), 1)
+    if slash_ratio > 0.05:
+        return True
+    return False
+
+
+def validate_legal_document(text: str, source_type: str) -> bool:
+    """
+    법률 문서 유효성 검증 (Red Team #6)
+
+    Args:
+        text: 정제된 문서 텍스트
+        source_type: "law" | "precedent" | "store_policy"
+
+    Returns:
+        True면 유효한 법률 문서
+    """
+    if not text or not text.strip():
+        return False
+
+    # 1. 노이즈 패턴 탐지 (CSS/JS 등)
+    if _is_noise_text(text):
+        return False
+
+    # 2. 소스 타입별 최소 길이 검증
+    min_lengths = {"law": 100, "precedent": 80, "store_policy": 50}
+    min_len = min_lengths.get(source_type, 50)
+    if len(text.strip()) < min_len:
+        return False
+
+    # 3. 소스 타입별 법률 키워드 포함 여부
+    keyword_map = {
+        "law": LEGAL_KEYWORDS_LAW,
+        "precedent": LEGAL_KEYWORDS_PRECEDENT,
+        "store_policy": LEGAL_KEYWORDS_POLICY,
+    }
+    keywords = keyword_map.get(source_type, LEGAL_KEYWORDS_LAW)
+    keyword_hits = sum(1 for kw in keywords if kw in text)
+    if keyword_hits < 2:
+        return False
+
+    return True
+
+
 def _clean_html(text: str) -> str:
     """HTML 태그 및 노이즈 제거"""
+    # 스크립트/스타일 블록 전체 제거
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"&[a-zA-Z]+;", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -260,6 +379,88 @@ def _append_chunk(
     )
 
 
+def chunk_precedent_text(
+    text: str,
+    metadata: dict,
+    chunk_size: int = 1200,
+    overlap: int = 300,
+) -> list[dict]:
+    """
+    판례 텍스트 전용 청킹 (Red Team #10)
+
+    판례는 [판시사항], [판결요지] 등의 섹션 헤더를 기준으로 분할합니다.
+    조문 경계(제N조)가 없는 판례 특성에 맞게:
+    - 섹션 헤더 기반 분할 우선
+    - chunk_size를 1200자로 확대 (법률 문맥 유지)
+    - overlap을 300자로 확대 (문맥 손실 방지)
+
+    Args:
+        text: 판례 원문 텍스트
+        metadata: 원천 메타데이터
+        chunk_size: 청크 최대 글자 수
+        overlap: 청크 간 겹침 글자 수
+
+    Returns:
+        [{"id": str, "text": str, "metadata": dict}, ...]
+    """
+    cleaned = _clean_html(text)
+    if not cleaned:
+        return []
+
+    source_id = metadata.get("source_id", "unknown")
+
+    # 판례 섹션 헤더 기반 분할 (판시사항, 판결요지, 참조조문, 판례내용 등)
+    section_pattern = r"(?=\[(판시사항|판결요지|참조조문|참조판례|판례내용|이유|주문|청구취지)\])"
+    segments = re.split(section_pattern, cleaned)
+    # re.split with group captures: merge header + content pairs
+    merged_segments: list[str] = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i].strip()
+        if seg in ("판시사항", "판결요지", "참조조문", "참조판례", "판례내용", "이유", "주문", "청구취지"):
+            # 이 헤더는 다음 세그먼트 앞에 붙여야 함
+            if i + 1 < len(segments):
+                merged_segments.append(f"[{seg}] {segments[i + 1].strip()}")
+                i += 2
+            else:
+                merged_segments.append(f"[{seg}]")
+                i += 1
+        else:
+            if seg:
+                merged_segments.append(seg)
+            i += 1
+
+    # 섹션 분할 결과가 없으면 원본 사용
+    if not merged_segments:
+        merged_segments = [cleaned]
+
+    chunks: list[dict] = []
+    current = ""
+
+    for segment in merged_segments:
+        if len(current) + len(segment) + 1 <= chunk_size:
+            current += (" " if current else "") + segment
+            continue
+
+        if current:
+            _append_chunk(chunks, current, metadata, source_id)
+
+        # 세그먼트가 한도 초과 시 글자 수 기반 분할
+        if len(segment) > chunk_size:
+            for j in range(0, len(segment), chunk_size - overlap):
+                sub = segment[j : j + chunk_size].strip()
+                if sub:
+                    _append_chunk(chunks, sub, metadata, source_id)
+            current = ""
+        else:
+            current = segment
+
+    if current.strip():
+        _append_chunk(chunks, current.strip(), metadata, source_id)
+
+    return chunks
+
+
 # ─────────────────────────────────────────────────────────────
 # Step 3: 데이터 적재 (Ingestion)
 # ─────────────────────────────────────────────────────────────
@@ -305,51 +506,109 @@ def _extract_law_text(detail: dict) -> str:
 
 
 def _extract_precedent_text(detail: dict) -> str:
-    """판례 상세 응답에서 본문 텍스트 추출"""
-    # 구조화된 XML 응답 시도
-    prec = detail.get("판례", {})
+    """
+    판례 상세 응답에서 본문 텍스트 추출 (Red Team #1, #4 개선)
+
+    1. 구조화된 XML 필드(판시사항, 판결요지 등)를 우선 추출
+    2. dict/OrderedDict 중첩 구조 재귀 탐색
+    3. CSS/JS 노이즈 필터링 강화
+    4. 유효성 검증 후 반환
+    """
+    # API 응답 키: XML type → "PrecService", 구버전 → "판례"
+    prec = detail.get("PrecService", {})
     if not prec:
-        prec = detail.get("PrecService", {})
+        prec = detail.get("판례", {})
+    if not prec:
+        # 최상위에 직접 필드가 있는 경우도 탐색
+        prec = detail
 
     parts: list[str] = []
     field_keys = ["판시사항", "판결요지", "참조조문", "참조판례", "판례내용"]
 
     for key in field_keys:
         value = prec.get(key, "")
-        if value and isinstance(value, str):
-            parts.append(f"[{key}]\n{value}")
+        # dict/OrderedDict인 경우 내부 텍스트 재귀 추출
+        if isinstance(value, dict):
+            extracted = _extract_text_recursive(value)
+            if extracted and not _is_noise_text(extracted):
+                parts.append(f"[{key}]\n{extracted}")
+        elif isinstance(value, str):
+            cleaned = _clean_html(value)
+            if cleaned and len(cleaned) > 20 and not _is_noise_text(cleaned):
+                parts.append(f"[{key}]\n{cleaned}")
 
-    # 필드 매칭 실패 시 긴 문자열 수집
+    # 구조화 필드 실패 시: 모든 값에서 유효 텍스트 수집
     if not parts:
-        for value in prec.values():
+        for key, value in prec.items():
             if isinstance(value, str) and len(value) > 50:
-                parts.append(value)
+                cleaned = _clean_html(value)
+                if cleaned and not _is_noise_text(cleaned):
+                    parts.append(cleaned)
+            elif isinstance(value, dict):
+                extracted = _extract_text_recursive(value)
+                if extracted and len(extracted) > 50 and not _is_noise_text(extracted):
+                    parts.append(extracted)
 
-    # HTML 응답인 경우 (API가 HTML로 반환할 때)
+    # HTML 응답 폴백 (노이즈 검증 강화)
     if not parts and "html" in detail:
         html_text = _extract_text_from_html_dict(detail["html"])
-        if html_text:
+        if html_text and not _is_noise_text(html_text):
             parts.append(html_text)
 
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+
+    # 최종 노이즈 검증
+    if _is_noise_text(result):
+        return ""
+
+    return result
+
+
+def _extract_text_recursive(obj: object) -> str:
+    """dict/list 구조에서 텍스트를 재귀적으로 추출"""
+    texts: list[str] = []
+
+    if isinstance(obj, str):
+        cleaned = _clean_html(obj)
+        if cleaned and len(cleaned) > 10 and not _is_noise_text(cleaned):
+            texts.append(cleaned)
+    elif isinstance(obj, dict):
+        # #text 키는 XML 텍스트 노드
+        if "#text" in obj:
+            val = obj["#text"]
+            if isinstance(val, str):
+                cleaned = _clean_html(val)
+                if cleaned and not _is_noise_text(cleaned):
+                    texts.append(cleaned)
+        for v in obj.values():
+            texts.append(_extract_text_recursive(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            texts.append(_extract_text_recursive(item))
+
+    return " ".join(t for t in texts if t.strip())
 
 
 def _extract_text_from_html_dict(html_dict: dict) -> str:
-    """HTML dict 구조에서 텍스트 콘텐츠 추출"""
+    """
+    HTML dict 구조에서 텍스트 콘텐츠 추출 (Red Team #4 개선)
+
+    노이즈 필터링을 강화하여 CSS/JS 경로가 저장되지 않도록 합니다.
+    """
     texts: list[str] = []
 
     def _walk(obj: object) -> None:
         if isinstance(obj, str):
             cleaned = _clean_html(obj)
-            if cleaned and len(cleaned) > 30:
+            # 최소 길이 + 노이즈 패턴 검증
+            if cleaned and len(cleaned) > 30 and not _is_noise_text(cleaned):
                 texts.append(cleaned)
         elif isinstance(obj, dict):
-            # #text 키는 직접 텍스트 노드
             if "#text" in obj:
                 val = obj["#text"]
                 if isinstance(val, str):
                     cleaned = _clean_html(val)
-                    if cleaned and len(cleaned) > 30:
+                    if cleaned and len(cleaned) > 30 and not _is_noise_text(cleaned):
                         texts.append(cleaned)
             for v in obj.values():
                 _walk(v)
@@ -363,7 +622,7 @@ def _extract_text_from_html_dict(html_dict: dict) -> str:
 
 def ingest_laws(query: str, max_items: int = 100) -> int:
     """
-    법령 검색 → 상세 조회 → 청킹 → 벡터 스토어 저장
+    법령 검색 → 상세 조회 → 품질 검증 → 청킹 → 벡터 스토어 저장
 
     Args:
         query: 검색 키워드
@@ -374,6 +633,7 @@ def ingest_laws(query: str, max_items: int = 100) -> int:
     """
     store = get_or_create_collection(COLLECTION_LAWS)
     total_chunks = 0
+    failed_items: list[dict] = []
 
     try:
         result = search_laws(query, display=min(max_items, 100))
@@ -381,7 +641,7 @@ def ingest_laws(query: str, max_items: int = 100) -> int:
         if not isinstance(laws, list):
             laws = [laws] if laws else []
     except Exception as e:
-        print(f"[LegalRAG] 법령 검색 실패: {e}")
+        logger.error(f"법령 검색 실패: {e}")
         return 0
 
     for law in laws[:max_items]:
@@ -396,6 +656,12 @@ def ingest_laws(query: str, max_items: int = 100) -> int:
             if not law_content:
                 continue
 
+            # Red Team #6: 데이터 품질 검증
+            if not validate_legal_document(law_content, "law"):
+                logger.warning(f"법령 품질 검증 실패 (스킵): {law_name}")
+                failed_items.append({"id": law_id, "name": law_name, "reason": "validation_failed"})
+                continue
+
             metadata = {
                 "source_type": "law",
                 "source_id": f"law_{law_id}",
@@ -403,6 +669,7 @@ def ingest_laws(query: str, max_items: int = 100) -> int:
                 "law_name": str(law_name),
                 "proclamation_date": str(law.get("공포일자", "")),
                 "enforcement_date": str(law.get("시행일자", "")),
+                "source_url": f"https://www.law.go.kr/법령/{law_name}",
             }
 
             chunks = chunk_law_text(law_content, metadata)
@@ -413,18 +680,24 @@ def ingest_laws(query: str, max_items: int = 100) -> int:
                     metadatas=[c["metadata"] for c in chunks],
                 )
                 total_chunks += len(chunks)
-                print(f"[LegalRAG] 법령 적재: {law_name} ({len(chunks)}청크)")
+                logger.info(f"법령 적재: {law_name} ({len(chunks)}청크)")
 
         except Exception as e:
-            print(f"[LegalRAG] 법령 상세 조회 실패 ({law_name}): {e}")
+            logger.error(f"법령 상세 조회 실패 ({law_name}): {e}")
+            failed_items.append({"id": law_id, "name": law_name, "reason": str(e)})
             continue
+
+    if failed_items:
+        logger.warning(f"법령 적재 실패 {len(failed_items)}건: {[f['name'] for f in failed_items]}")
 
     return total_chunks
 
 
 def ingest_precedents(query: str, max_items: int = 50) -> int:
     """
-    판례 검색 → 상세 조회 → 청킹 → 벡터 스토어 저장
+    판례 검색 → 상세 조회 → 품질 검증 → 청킹 → 벡터 스토어 저장
+
+    Red Team #1, #4, #6, #7 개선 반영
 
     Args:
         query: 검색 키워드
@@ -435,6 +708,8 @@ def ingest_precedents(query: str, max_items: int = 50) -> int:
     """
     store = get_or_create_collection(COLLECTION_PRECEDENTS)
     total_chunks = 0
+    failed_items: list[dict] = []
+    skipped_noise = 0
 
     try:
         result = search_precedents(query, display=min(max_items, 100))
@@ -442,7 +717,7 @@ def ingest_precedents(query: str, max_items: int = 50) -> int:
         if not isinstance(precs, list):
             precs = [precs] if precs else []
     except Exception as e:
-        print(f"[LegalRAG] 판례 검색 실패: {e}")
+        logger.error(f"판례 검색 실패: {e}")
         return 0
 
     for prec in precs[:max_items]:
@@ -454,9 +729,23 @@ def ingest_precedents(query: str, max_items: int = 50) -> int:
         try:
             detail = get_precedent_detail(prec_seq)
             prec_content = _extract_precedent_text(detail)
+
+            # Red Team #1: 빈 내용 또는 노이즈만 추출된 경우 스킵
             if not prec_content:
+                skipped_noise += 1
+                logger.warning(f"판례 본문 추출 실패 (노이즈/빈 내용): {case_name} (seq={prec_seq})")
+                failed_items.append({"seq": prec_seq, "name": case_name, "reason": "empty_or_noise"})
                 continue
 
+            # Red Team #6: 데이터 품질 검증
+            if not validate_legal_document(prec_content, "precedent"):
+                skipped_noise += 1
+                logger.warning(f"판례 품질 검증 실패 (스킵): {case_name} (seq={prec_seq})")
+                failed_items.append({"seq": prec_seq, "name": case_name, "reason": "validation_failed"})
+                continue
+
+            # Red Team #7: 메타데이터 보강
+            prec_detail = detail.get("PrecService", {}) or detail.get("판례", {}) or {}
             metadata = {
                 "source_type": "precedent",
                 "source_id": f"prec_{prec_seq}",
@@ -464,9 +753,13 @@ def ingest_precedents(query: str, max_items: int = 50) -> int:
                 "case_name": str(case_name),
                 "court_name": str(prec.get("법원명", "")),
                 "judgment_date": str(prec.get("선고일자", "")),
+                "case_number": str(prec.get("사건번호", prec_detail.get("사건번호", ""))),
+                "case_type": str(prec.get("사건종류명", prec_detail.get("사건종류명", ""))),
+                "source_url": f"https://www.law.go.kr/판례/{case_name}",
             }
 
-            chunks = chunk_law_text(prec_content, metadata)
+            # 판례용 청킹 (Red Team #10)
+            chunks = chunk_precedent_text(prec_content, metadata)
             if chunks:
                 store.upsert(
                     ids=[c["id"] for c in chunks],
@@ -474,11 +767,17 @@ def ingest_precedents(query: str, max_items: int = 50) -> int:
                     metadatas=[c["metadata"] for c in chunks],
                 )
                 total_chunks += len(chunks)
-                print(f"[LegalRAG] 판례 적재: {case_name} ({len(chunks)}청크)")
+                logger.info(f"판례 적재: {case_name} ({len(chunks)}청크)")
 
         except Exception as e:
-            print(f"[LegalRAG] 판례 상세 조회 실패 ({case_name}): {e}")
+            logger.error(f"판례 상세 조회 실패 ({case_name}): {e}")
+            failed_items.append({"seq": prec_seq, "name": case_name, "reason": str(e)})
             continue
+
+    if skipped_noise > 0:
+        logger.warning(f"판례 노이즈/품질 실패로 {skipped_noise}건 스킵")
+    if failed_items:
+        logger.warning(f"판례 적재 실패 총 {len(failed_items)}건")
 
     return total_chunks
 
@@ -589,12 +888,65 @@ def search_legal_context(
 # Step 5: 데이터 동기화 (F-6)
 # ─────────────────────────────────────────────────────────────
 
+def _save_sync_metadata(summary: dict, queries: list[str]) -> None:
+    """
+    동기화 메타데이터를 database/metadata.json에 저장 (Red Team #8)
+    """
+    metadata_path = os.path.join(DATABASE_PATH, "metadata.json")
+    existing: dict = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+
+    # 버전 자동 증가
+    version = existing.get("version", "1.0.0")
+    parts = version.split(".")
+    try:
+        parts[-1] = str(int(parts[-1]) + 1)
+        new_version = ".".join(parts)
+    except ValueError:
+        new_version = "1.0.1"
+
+    # 컬렉션 현재 상태
+    collections_status = {}
+    for name in ALL_COLLECTIONS:
+        try:
+            store = get_or_create_collection(name)
+            collections_status[name] = store.count()
+        except Exception:
+            collections_status[name] = 0
+
+    metadata = {
+        "last_sync": datetime.now(timezone.utc).isoformat(),
+        "version": new_version,
+        "sync_queries": queries,
+        "sync_result": summary,
+        "collections": collections_status,
+        "sync_history": existing.get("sync_history", []) + [
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "queries": queries,
+                "result": summary,
+            }
+        ],
+    }
+
+    os.makedirs(DATABASE_PATH, exist_ok=True)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"동기화 메타데이터 저장: version={new_version}, path={metadata_path}")
+
+
 def sync_legal_data(
     queries: list[str],
     force_refresh: bool = False,
 ) -> dict:
     """
-    Vector DB 데이터 동기화
+    Vector DB 데이터 동기화 (Red Team #8: 버전 관리 추가)
 
     Args:
         queries: 동기화할 검색 키워드 목록
@@ -607,13 +959,13 @@ def sync_legal_data(
         for name in [COLLECTION_LAWS, COLLECTION_PRECEDENTS]:
             store = get_or_create_collection(name)
             store.clear()
-            print(f"[LegalRAG] 컬렉션 초기화: {name}")
+            logger.info(f"컬렉션 초기화: {name}")
 
     laws_total = 0
     precs_total = 0
 
     for q in queries:
-        print(f"\n[LegalRAG] 동기화 쿼리: '{q}'")
+        logger.info(f"동기화 쿼리: '{q}'")
         laws_total += ingest_laws(q, max_items=50)
         precs_total += ingest_precedents(q, max_items=30)
 
@@ -622,7 +974,11 @@ def sync_legal_data(
         "precedents_added": precs_total,
         "total_chunks": laws_total + precs_total,
     }
-    print(f"\n[LegalRAG] 동기화 완료: {summary}")
+
+    # Red Team #8: 동기화 메타데이터 저장
+    _save_sync_metadata(summary, queries)
+
+    logger.info(f"동기화 완료: {summary}")
     return summary
 
 
