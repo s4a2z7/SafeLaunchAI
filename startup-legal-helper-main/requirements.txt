@@ -1,0 +1,27 @@
+# SafeLaunch AI Dependencies
+
+# Web Framework
+streamlit>=1.30.0
+
+# HTTP & API
+requests>=2.31.0
+
+# XML Parsing
+xmltodict>=0.13.0
+
+# Data Processing
+pandas>=2.1.0
+
+# Web Scraping
+selenium>=4.16.0
+beautifulsoup4>=4.12.0
+
+# Vector DB
+chromadb>=0.4.22
+
+# AI / LLM
+anthropic>=0.18.0
+# langchain>=0.1.0  # optional
+
+# Utilities
+python-dotenv>=1.0.0
