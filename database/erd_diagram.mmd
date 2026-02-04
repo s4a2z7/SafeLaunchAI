@@ -1,0 +1,201 @@
+%% ============================================================
+%% SafeLaunch AI -- ERD v2.0 (11 tables, YAGNI applied)
+%% Mermaid.js (https://mermaid.js.org/)
+%% Preview: https://mermaid.live/
+%% ============================================================
+
+erDiagram
+
+    %% -----------------------------------------
+    %% A. Users + Projects
+    %% -----------------------------------------
+
+    users {
+        TEXT id PK "UUID"
+        TEXT email UK "UNIQUE"
+        TEXT password_hash "BCrypt"
+        TEXT display_name "name"
+        TEXT role "user/admin"
+        TEXT company_name "company"
+        INT is_active "1/0"
+        TEXT created_at "ISO8601"
+        TEXT updated_at "ISO8601"
+    }
+
+    projects {
+        TEXT id PK "UUID"
+        TEXT user_id FK "users.id"
+        TEXT name "app name"
+        TEXT description "desc"
+        TEXT app_category "category"
+        TEXT status "draft/analyzing/completed/archived"
+        TEXT platforms "JSON array"
+        TEXT regions "JSON array"
+        TEXT features "JSON object"
+        TEXT created_at "ISO8601"
+        TEXT updated_at "ISO8601"
+    }
+
+    %% -----------------------------------------
+    %% B. Legal Data Catalog
+    %% -----------------------------------------
+
+    laws {
+        TEXT id PK "UUID"
+        TEXT law_id UK "API ID"
+        TEXT law_name "name"
+        TEXT law_type "type"
+        TEXT proclamation_date "date"
+        TEXT enforcement_date "date"
+        TEXT source_url "URL"
+        TEXT raw_content "full text"
+        INT is_active "1/0"
+        TEXT created_at "ISO8601"
+        TEXT updated_at "ISO8601"
+    }
+
+    precedents {
+        TEXT id PK "UUID"
+        TEXT precedent_seq UK "API seq"
+        TEXT case_name "name"
+        TEXT court_name "court"
+        TEXT judgment_date "date"
+        TEXT case_number "number"
+        TEXT case_type "civil/criminal/admin"
+        TEXT source_url "URL"
+        TEXT raw_content "full text"
+        INT is_active "1/0"
+        TEXT created_at "ISO8601"
+        TEXT updated_at "ISO8601"
+    }
+
+    store_policies {
+        TEXT id PK "UUID"
+        TEXT store "apple/google"
+        TEXT policy_name "doc name"
+        TEXT section "section"
+        TEXT subsection "subsection"
+        TEXT content "policy text"
+        TEXT effective_date "date"
+        INT is_current "1/0"
+        TEXT created_at "ISO8601"
+        TEXT updated_at "ISO8601"
+    }
+
+    %% -----------------------------------------
+    %% C. RAG Search
+    %% -----------------------------------------
+
+    document_chunks {
+        TEXT id PK "UUID"
+        TEXT chunk_hash UK "MD5"
+        TEXT source_type "law/precedent/store_policy"
+        TEXT source_id "source table id"
+        INT chunk_index "order"
+        TEXT content "chunk text"
+        INT content_length "length"
+        TEXT metadata_json "JSON"
+        TEXT created_at "ISO8601"
+    }
+
+    search_logs {
+        TEXT id PK "UUID"
+        TEXT user_id FK "users.id"
+        TEXT project_id FK "projects.id"
+        TEXT query_text "query"
+        INT result_count "count"
+        REAL top_score "score"
+        INT search_duration_ms "ms"
+        TEXT created_at "ISO8601"
+    }
+
+    %% -----------------------------------------
+    %% D. Analysis Results
+    %% -----------------------------------------
+
+    compliance_analyses {
+        TEXT id PK "UUID"
+        TEXT project_id FK "projects.id"
+        TEXT user_id FK "users.id"
+        TEXT analysis_type "full/quick/targeted"
+        TEXT status "pending/in_progress/completed/failed"
+        TEXT overall_risk_level "low/medium/high/critical"
+        INT total_findings "count"
+        INT critical_count "count"
+        INT high_count "count"
+        INT medium_count "count"
+        INT low_count "count"
+        TEXT summary "AI summary"
+        TEXT ai_model_used "model"
+        TEXT started_at "ISO8601"
+        TEXT completed_at "ISO8601"
+        TEXT created_at "ISO8601"
+    }
+
+    analysis_findings {
+        TEXT id PK "UUID"
+        TEXT analysis_id FK "compliance_analyses.id"
+        TEXT finding_type "violation/warning/recommendation/pass"
+        TEXT severity "low/medium/high/critical"
+        TEXT category "privacy/content/payment/ip/safety"
+        TEXT title "title"
+        TEXT description "detail"
+        TEXT recommendation "action"
+        TEXT affected_platform "ios/android/both"
+        INT is_resolved "1/0"
+        TEXT created_at "ISO8601"
+    }
+
+    finding_references {
+        TEXT id PK "UUID"
+        TEXT finding_id FK "analysis_findings.id"
+        TEXT reference_type "law/precedent/store_policy"
+        TEXT reference_id "source id"
+        TEXT chunk_id FK "document_chunks.id"
+        REAL relevance_score "0~1"
+        TEXT cited_text "quote"
+        TEXT created_at "ISO8601"
+    }
+
+    %% -----------------------------------------
+    %% FTS5 Search Index
+    %% -----------------------------------------
+
+    chunks_fts {
+        TEXT content "FTS5 indexed"
+        TEXT source_type "law/precedent/store_policy"
+    }
+
+    %% -----------------------------------------
+    %% E. Sync
+    %% -----------------------------------------
+
+    sync_logs {
+        TEXT id PK "UUID"
+        TEXT sync_type "laws/precedents/policies/full"
+        TEXT status "started/completed/failed"
+        TEXT queries_used "JSON"
+        INT items_added "count"
+        INT items_failed "count"
+        INT chunks_created "count"
+        TEXT error_message "error"
+        TEXT started_at "ISO8601"
+        TEXT completed_at "ISO8601"
+    }
+
+
+    %% -----------------------------------------
+    %% Relationships
+    %% -----------------------------------------
+
+    users ||--o{ projects : "owns"
+    users ||--o{ search_logs : "searches"
+    users ||--o{ compliance_analyses : "requests"
+
+    projects ||--o{ search_logs : "searched for"
+    projects ||--o{ compliance_analyses : "analyzed"
+
+    compliance_analyses ||--o{ analysis_findings : "produces"
+    analysis_findings ||--o{ finding_references : "cites"
+    document_chunks ||--o{ finding_references : "referenced by"
+    document_chunks ||--|| chunks_fts : "FTS5 index"
