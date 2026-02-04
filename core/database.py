@@ -155,6 +155,29 @@ class DatabaseManager:
             ).fetchone()
             return dict(row) if row else None
 
+    def update_user(self, user_id: str, **kwargs) -> bool:
+        """사용자 정보 수정 (허용 필드: display_name, role, company_name, is_active)"""
+        allowed = {"display_name", "role", "company_name", "is_active"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return False
+
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        values = list(updates.values()) + [_now(), user_id]
+
+        with self.connection() as conn:
+            conn.execute(
+                f"UPDATE users SET {set_clause}, updated_at=? WHERE id=?",
+                values,
+            )
+        return True
+
+    def delete_user(self, user_id: str) -> bool:
+        """사용자 삭제 (CASCADE로 관련 프로젝트·분석도 삭제)"""
+        with self.connection() as conn:
+            cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            return cursor.rowcount > 0
+
     # ─────────────────────────────────────────────────────────
     # A. 프로젝트 (JSON 컬럼 방식)
     # ─────────────────────────────────────────────────────────
@@ -212,18 +235,55 @@ class DatabaseManager:
             project["features"] = json.loads(project.get("features") or "{}")
             return project
 
-    def list_projects(self, user_id: str) -> list[dict]:
-        """사용자의 프로젝트 목록 조회"""
+    def list_projects(
+        self,
+        user_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """사용자의 프로젝트 목록 조회 (페이지네이션)"""
         with self.connection() as conn:
             rows = conn.execute(
                 """SELECT p.*,
                           (SELECT count(*) FROM compliance_analyses ca WHERE ca.project_id = p.id) as analysis_count
                    FROM projects p
                    WHERE p.user_id = ?
-                   ORDER BY p.updated_at DESC""",
-                (user_id,),
+                   ORDER BY p.updated_at DESC
+                   LIMIT ? OFFSET ?""",
+                (user_id, limit, offset),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def update_project(self, project_id: str, **kwargs) -> bool:
+        """프로젝트 수정 (허용 필드: name, description, app_category, status, platforms, regions, features)"""
+        allowed = {"name", "description", "app_category", "status"}
+        json_fields = {"platforms", "regions", "features"}
+
+        updates: dict = {}
+        for k, v in kwargs.items():
+            if k in allowed:
+                updates[k] = v
+            elif k in json_fields:
+                updates[k] = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+
+        if not updates:
+            return False
+
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        values = list(updates.values()) + [_now(), project_id]
+
+        with self.connection() as conn:
+            conn.execute(
+                f"UPDATE projects SET {set_clause}, updated_at=? WHERE id=?",
+                values,
+            )
+        return True
+
+    def delete_project(self, project_id: str) -> bool:
+        """프로젝트 삭제 (CASCADE로 관련 분석도 삭제)"""
+        with self.connection() as conn:
+            cursor = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            return cursor.rowcount > 0
 
     # ─────────────────────────────────────────────────────────
     # B. 법률 데이터 카탈로그
@@ -280,6 +340,39 @@ class DatabaseManager:
                     ),
                 )
                 return db_id
+
+    def get_law(self, law_db_id: str) -> Optional[dict]:
+        """법령 단건 조회 (내부 DB id)"""
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM laws WHERE id = ?", (law_db_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_law_by_law_id(self, law_id: str) -> Optional[dict]:
+        """법령 단건 조회 (API 원본 법령일련번호)"""
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM laws WHERE law_id = ?", (law_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_laws(self, limit: int = 50, offset: int = 0, keyword: Optional[str] = None) -> list[dict]:
+        """법령 목록 조회 (페이지네이션 + 키워드 필터)"""
+        with self.connection() as conn:
+            if keyword:
+                rows = conn.execute(
+                    """SELECT id, law_id, law_name, law_type, proclamation_date,
+                              enforcement_date, is_active, created_at
+                       FROM laws WHERE law_name LIKE ? AND is_active=1
+                       ORDER BY law_name LIMIT ? OFFSET ?""",
+                    (f"%{keyword}%", limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, law_id, law_name, law_type, proclamation_date,
+                              enforcement_date, is_active, created_at
+                       FROM laws WHERE is_active=1
+                       ORDER BY law_name LIMIT ? OFFSET ?""",
+                    (limit, offset),
+                ).fetchall()
+            return [dict(r) for r in rows]
 
     def upsert_precedent(
         self,
@@ -338,6 +431,43 @@ class DatabaseManager:
                     ),
                 )
                 return db_id
+
+    def get_precedent(self, prec_db_id: str) -> Optional[dict]:
+        """판례 단건 조회 (내부 DB id)"""
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM precedents WHERE id = ?", (prec_db_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_precedent_by_seq(self, precedent_seq: str) -> Optional[dict]:
+        """판례 단건 조회 (API 원본 판례일련번호)"""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM precedents WHERE precedent_seq = ?", (precedent_seq,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_precedents(
+        self, limit: int = 50, offset: int = 0, keyword: Optional[str] = None
+    ) -> list[dict]:
+        """판례 목록 조회 (페이지네이션 + 키워드 필터)"""
+        with self.connection() as conn:
+            if keyword:
+                rows = conn.execute(
+                    """SELECT id, precedent_seq, case_name, court_name,
+                              judgment_date, case_number, case_type, is_active, created_at
+                       FROM precedents WHERE case_name LIKE ? AND is_active=1
+                       ORDER BY judgment_date DESC LIMIT ? OFFSET ?""",
+                    (f"%{keyword}%", limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, precedent_seq, case_name, court_name,
+                              judgment_date, case_number, case_type, is_active, created_at
+                       FROM precedents WHERE is_active=1
+                       ORDER BY judgment_date DESC LIMIT ? OFFSET ?""",
+                    (limit, offset),
+                ).fetchall()
+            return [dict(r) for r in rows]
 
     def upsert_store_policy(
         self,
@@ -618,6 +748,100 @@ class DatabaseManager:
             if not row:
                 return None
             return self.get_analysis(row["id"])
+
+    def list_analyses(
+        self,
+        project_id: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict]:
+        """프로젝트의 분석 목록 조회 (페이지네이션, 발견 사항 제외)"""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM compliance_analyses
+                   WHERE project_id = ?
+                   ORDER BY created_at DESC
+                   LIMIT ? OFFSET ?""",
+                (project_id, limit, offset),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def search_chunks(
+        self,
+        keyword: str,
+        source_type: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict]:
+        """문서 청크 키워드 검색 (LIKE 기반, 폴백)"""
+        with self.connection() as conn:
+            if source_type:
+                rows = conn.execute(
+                    """SELECT id, chunk_hash, source_type, source_id, chunk_index,
+                              content, content_length, created_at
+                       FROM document_chunks
+                       WHERE content LIKE ? AND source_type = ?
+                       LIMIT ? OFFSET ?""",
+                    (f"%{keyword}%", source_type, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, chunk_hash, source_type, source_id, chunk_index,
+                              content, content_length, created_at
+                       FROM document_chunks
+                       WHERE content LIKE ?
+                       LIMIT ? OFFSET ?""",
+                    (f"%{keyword}%", limit, offset),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def fts_search(
+        self,
+        query: str,
+        source_type: Optional[str] = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """FTS5 전문 검색 (BM25 랭킹)"""
+        with self.connection() as conn:
+            try:
+                if source_type:
+                    rows = conn.execute(
+                        """SELECT dc.id, dc.chunk_hash, dc.source_type, dc.source_id,
+                                  dc.chunk_index, dc.content, dc.content_length,
+                                  dc.metadata_json, dc.created_at,
+                                  chunks_fts.rank AS fts_rank
+                           FROM chunks_fts
+                           JOIN document_chunks dc ON dc.rowid = chunks_fts.rowid
+                           WHERE chunks_fts MATCH ? AND dc.source_type = ?
+                           ORDER BY chunks_fts.rank
+                           LIMIT ?""",
+                        (query, source_type, limit),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """SELECT dc.id, dc.chunk_hash, dc.source_type, dc.source_id,
+                                  dc.chunk_index, dc.content, dc.content_length,
+                                  dc.metadata_json, dc.created_at,
+                                  chunks_fts.rank AS fts_rank
+                           FROM chunks_fts
+                           JOIN document_chunks dc ON dc.rowid = chunks_fts.rowid
+                           WHERE chunks_fts MATCH ?
+                           ORDER BY chunks_fts.rank
+                           LIMIT ?""",
+                        (query, limit),
+                    ).fetchall()
+
+                results = []
+                for row in rows:
+                    d = dict(row)
+                    if d.get("metadata_json"):
+                        d["metadata"] = json.loads(d["metadata_json"])
+                    results.append(d)
+                return results
+
+            except Exception as e:
+                logger.warning(f"FTS5 검색 실패, LIKE 폴백: {e}")
+                return self.search_chunks(query, source_type=source_type, limit=limit)
 
     # ─────────────────────────────────────────────────────────
     # E. 동기화

@@ -229,6 +229,45 @@ CREATE INDEX IF NOT EXISTS idx_sync_logs_type ON sync_logs(sync_type);
 -- 뷰 (View)
 -- ============================================================
 
+-- ============================================================
+-- FTS5 전문 검색 인덱스 (document_chunks용)
+-- ============================================================
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    content,
+    source_type,
+    content='document_chunks',
+    content_rowid='rowid'
+);
+
+-- FTS 동기화 트리거: INSERT
+CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON document_chunks
+BEGIN
+    INSERT INTO chunks_fts(rowid, content, source_type)
+    VALUES (NEW.rowid, NEW.content, NEW.source_type);
+END;
+
+-- FTS 동기화 트리거: DELETE
+CREATE TRIGGER IF NOT EXISTS chunks_fts_delete BEFORE DELETE ON document_chunks
+BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, content, source_type)
+    VALUES ('delete', OLD.rowid, OLD.content, OLD.source_type);
+END;
+
+-- FTS 동기화 트리거: UPDATE
+CREATE TRIGGER IF NOT EXISTS chunks_fts_update AFTER UPDATE OF content ON document_chunks
+BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, content, source_type)
+    VALUES ('delete', OLD.rowid, OLD.content, OLD.source_type);
+    INSERT INTO chunks_fts(rowid, content, source_type)
+    VALUES (NEW.rowid, NEW.content, NEW.source_type);
+END;
+
+
+-- ============================================================
+-- 뷰 (View)
+-- ============================================================
+
 -- 발견 사항 + 근거 자료 통합 뷰
 CREATE VIEW IF NOT EXISTS v_findings_detail AS
 SELECT

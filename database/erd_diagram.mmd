@@ -158,6 +158,15 @@ erDiagram
     }
 
     %% -----------------------------------------
+    %% FTS5 Search Index
+    %% -----------------------------------------
+
+    chunks_fts {
+        TEXT content "FTS5 indexed"
+        TEXT source_type "law/precedent/store_policy"
+    }
+
+    %% -----------------------------------------
     %% E. Sync
     %% -----------------------------------------
 
@@ -189,3 +198,4 @@ erDiagram
     compliance_analyses ||--o{ analysis_findings : "produces"
     analysis_findings ||--o{ finding_references : "cites"
     document_chunks ||--o{ finding_references : "referenced by"
+    document_chunks ||--|| chunks_fts : "FTS5 index"

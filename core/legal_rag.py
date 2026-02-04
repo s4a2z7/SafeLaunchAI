@@ -31,6 +31,13 @@ from core.law_api import (
     get_precedent_detail,
 )
 
+# DB 연동 (SQLite — database.py와 이중 적재)
+try:
+    from core.database import db as _db
+except Exception:
+    _db = None
+    logger.warning("database 모듈 로드 실패 — JSON VectorStore 단독 모드로 동작합니다.")
+
 # ─────────────────────────────────────────────────────────────
 # 로깅 설정
 # ─────────────────────────────────────────────────────────────
@@ -680,6 +687,30 @@ def ingest_laws(query: str, max_items: int = 100) -> int:
                     metadatas=[c["metadata"] for c in chunks],
                 )
                 total_chunks += len(chunks)
+
+                # SQLite DB 동시 적재
+                if _db:
+                    try:
+                        db_law_id = _db.upsert_law(
+                            law_id=str(law_id),
+                            law_name=str(law_name),
+                            raw_content=law_content,
+                            proclamation_date=metadata.get("proclamation_date"),
+                            enforcement_date=metadata.get("enforcement_date"),
+                            source_url=metadata.get("source_url"),
+                        )
+                        for chunk in chunks:
+                            _db.upsert_chunk(
+                                chunk_hash=chunk["id"],
+                                source_type="law",
+                                source_id=db_law_id,
+                                chunk_index=chunk["metadata"].get("chunk_index", 0),
+                                content=chunk["text"],
+                                metadata=chunk["metadata"],
+                            )
+                    except Exception as db_err:
+                        logger.warning(f"법령 DB 적재 실패 ({law_name}): {db_err}")
+
                 logger.info(f"법령 적재: {law_name} ({len(chunks)}청크)")
 
         except Exception as e:
@@ -767,6 +798,32 @@ def ingest_precedents(query: str, max_items: int = 50) -> int:
                     metadatas=[c["metadata"] for c in chunks],
                 )
                 total_chunks += len(chunks)
+
+                # SQLite DB 동시 적재
+                if _db:
+                    try:
+                        db_prec_id = _db.upsert_precedent(
+                            precedent_seq=str(prec_seq),
+                            case_name=str(case_name),
+                            raw_content=prec_content,
+                            court_name=metadata.get("court_name"),
+                            judgment_date=metadata.get("judgment_date"),
+                            case_number=metadata.get("case_number"),
+                            case_type=metadata.get("case_type"),
+                            source_url=metadata.get("source_url"),
+                        )
+                        for chunk in chunks:
+                            _db.upsert_chunk(
+                                chunk_hash=chunk["id"],
+                                source_type="precedent",
+                                source_id=db_prec_id,
+                                chunk_index=chunk["metadata"].get("chunk_index", 0),
+                                content=chunk["text"],
+                                metadata=chunk["metadata"],
+                            )
+                    except Exception as db_err:
+                        logger.warning(f"판례 DB 적재 실패 ({case_name}): {db_err}")
+
                 logger.info(f"판례 적재: {case_name} ({len(chunks)}청크)")
 
         except Exception as e:
@@ -832,10 +889,31 @@ def ingest_store_policies(
             total_chunks += len(chunks)
             section = metadata.get("section", "?")
             store_name = metadata.get("store", "?")
-            print(
-                f"[LegalRAG] 스토어 정책 적재: [{store_name}] {section}"
-                f" ({len(chunks)}청크)"
-            )
+
+            # SQLite DB 동시 적재
+            if _db:
+                try:
+                    db_policy_id = _db.upsert_store_policy(
+                        store=metadata.get("store", "unknown"),
+                        section=metadata.get("section", ""),
+                        subsection=metadata.get("subsection", ""),
+                        content=text,
+                        policy_name=metadata.get("policy_name", ""),
+                        effective_date=metadata.get("effective_date"),
+                    )
+                    for chunk in chunks:
+                        _db.upsert_chunk(
+                            chunk_hash=chunk["id"],
+                            source_type="store_policy",
+                            source_id=db_policy_id,
+                            chunk_index=chunk["metadata"].get("chunk_index", 0),
+                            content=chunk["text"],
+                            metadata=chunk["metadata"],
+                        )
+                except Exception as db_err:
+                    logger.warning(f"스토어 정책 DB 적재 실패 ([{store_name}] {section}): {db_err}")
+
+            logger.info(f"스토어 정책 적재: [{store_name}] {section} ({len(chunks)}청크)")
 
     return total_chunks
 
@@ -848,6 +926,8 @@ def search_legal_context(
     query: str,
     top_k: int = 5,
     score_threshold: float = 0.7,
+    user_id: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> list[dict]:
     """
     쿼리와 유사한 법령·판례·정책 청크 반환
@@ -856,10 +936,15 @@ def search_legal_context(
         query: 검색문
         top_k: 상위 결과 개수
         score_threshold: 유사도 하한 (미달 결과 제외 — 카더라 방지)
+        user_id: (선택) 검색 로그에 기록할 사용자 ID
+        project_id: (선택) 검색 로그에 기록할 프로젝트 ID
 
     Returns:
         [{"text": str, "metadata": dict, "score": float}, ...]
     """
+    import time as _time
+    _start = _time.perf_counter()
+
     results: list[dict] = []
 
     for col_name in ALL_COLLECTIONS:
@@ -876,12 +961,29 @@ def search_legal_context(
                     results.append(hit)
 
         except Exception as e:
-            print(f"[LegalRAG] {col_name} 검색 오류: {e}")
+            logger.error(f"{col_name} 검색 오류: {e}")
             continue
 
     # 유사도 내림차순 정렬 → top_k 제한
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_k]
+    results = results[:top_k]
+
+    # 검색 로그를 DB에 기록
+    duration_ms = int((_time.perf_counter() - _start) * 1000)
+    if _db:
+        try:
+            _db.log_search(
+                query_text=query,
+                result_count=len(results),
+                user_id=user_id,
+                project_id=project_id,
+                top_score=results[0]["score"] if results else None,
+                duration_ms=duration_ms,
+            )
+        except Exception as db_err:
+            logger.warning(f"검색 로그 DB 기록 실패: {db_err}")
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────────
@@ -955,6 +1057,14 @@ def sync_legal_data(
     Returns:
         {"laws_added": int, "precedents_added": int, "total_chunks": int}
     """
+    # DB sync_logs 기록 시작
+    sync_id = None
+    if _db:
+        try:
+            sync_id = _db.start_sync(sync_type="full", queries=queries)
+        except Exception as db_err:
+            logger.warning(f"sync_logs 시작 기록 실패: {db_err}")
+
     if force_refresh:
         for name in [COLLECTION_LAWS, COLLECTION_PRECEDENTS]:
             store = get_or_create_collection(name)
@@ -963,11 +1073,16 @@ def sync_legal_data(
 
     laws_total = 0
     precs_total = 0
+    sync_error = None
 
-    for q in queries:
-        logger.info(f"동기화 쿼리: '{q}'")
-        laws_total += ingest_laws(q, max_items=50)
-        precs_total += ingest_precedents(q, max_items=30)
+    try:
+        for q in queries:
+            logger.info(f"동기화 쿼리: '{q}'")
+            laws_total += ingest_laws(q, max_items=50)
+            precs_total += ingest_precedents(q, max_items=30)
+    except Exception as e:
+        sync_error = str(e)
+        logger.error(f"동기화 중 오류: {e}")
 
     summary = {
         "laws_added": laws_total,
@@ -975,8 +1090,20 @@ def sync_legal_data(
         "total_chunks": laws_total + precs_total,
     }
 
-    # Red Team #8: 동기화 메타데이터 저장
+    # JSON 메타데이터 저장 (호환성 유지)
     _save_sync_metadata(summary, queries)
+
+    # DB sync_logs 완료 기록
+    if _db and sync_id:
+        try:
+            _db.complete_sync(
+                sync_id=sync_id,
+                items_added=laws_total + precs_total,
+                chunks_created=laws_total + precs_total,
+                error_message=sync_error,
+            )
+        except Exception as db_err:
+            logger.warning(f"sync_logs 완료 기록 실패: {db_err}")
 
     logger.info(f"동기화 완료: {summary}")
     return summary
