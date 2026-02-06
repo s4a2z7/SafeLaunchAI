@@ -27,3 +27,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Vector Store
+faiss_index/
+chroma_db/
