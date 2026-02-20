@@ -27,3 +27,12 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Project Specific
+.streamlit/
+vector_cache/
+*.npy
+*.json
+!laws.json
+!precedents.json
+!policies.json
