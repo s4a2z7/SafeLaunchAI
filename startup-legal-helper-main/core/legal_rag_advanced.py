@@ -131,6 +131,48 @@ def search_legal_context(query: str, top_k: int = 5, score_threshold: float = 0.
         print(f"[AdvancedRAG] 검색 에러: {e}")
         return []
 
+
+def search_patent_context(query: str, top_k: int = 5) -> List[Dict]:
+    """
+    특허(Patent) 특화 검색 함수.
+    특허, 상표, 부정경쟁 관련 데이터를 우선적으로 탐색합니다.
+
+    Args:
+        query: 검색 쿼리 (예: "특허 침해 우회 전략", "소프트웨어 특허")
+        top_k: 반환할 최대 결과 수
+
+    Returns:
+        특허 관련 검색 결과 리스트
+    """
+    PATENT_KEYWORDS = ["특허", "상표", "부정경쟁방지", "영업비밀", "디자인권", "실용신안", "지식재산"]
+
+    # 특허 키워드로 쿼리 확장
+    expanded_query = f"{query} 특허 지식재산 침해"
+
+    try:
+        rag = get_advanced_rag()
+        results = rag.search(expanded_query, top_k=top_k * 3)  # 더 많이 검색 후 필터
+
+        # 특허/상표/영업비밀 관련 결과 우선 필터링
+        patent_hits = []
+        other_hits = []
+        for r in results:
+            text = r.get("text", "")
+            meta = r.get("metadata", {})
+            law_name = meta.get("law_name", "")
+            is_patent = any(kw in text or kw in law_name for kw in PATENT_KEYWORDS)
+            if is_patent:
+                patent_hits.append(r)
+            else:
+                other_hits.append(r)
+
+        # 특허 관련 결과를 앞에, 나머지를 뒤에 배치
+        combined = patent_hits + other_hits
+        return combined[:top_k]
+    except Exception as e:
+        print(f"[AdvancedRAG] 특허 검색 에러: {e}")
+        return []
+
 # ─────────────────────────────────────────────────────────────
 # 동기화 및 마이그레이션
 # ─────────────────────────────────────────────────────────────

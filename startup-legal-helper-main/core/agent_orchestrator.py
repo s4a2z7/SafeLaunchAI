@@ -8,19 +8,19 @@ startup-legal-helper-main/core/agent_orchestrator.py
 
 import os
 from typing import List, Dict, Any
-from dotenv import load_dotenv
 import anthropic
-
-load_dotenv()
+from core.secret_manager import secret_manager
 
 class LegalAgentTeam:
     """
     Claude Multi-Agent 팀 관리 클래스
     """
     def __init__(self):
-        api_key = os.getenv("ANTHROPIC_API_KEY")
+        # SecretManager를 통한 안전한 키 로드
+        api_key = secret_manager.get_anthropic_key()
         if not api_key:
-            print("[LegalAgentTeam] Warning: ANTHROPIC_API_KEY is not set.")
+            print("[LegalAgentTeam] Warning: ANTHROPIC_API_KEY가 설정되지 않았습니다.")
+            secret_manager.print_setup_guide()
             self.client = None
         else:
             self.client = anthropic.Anthropic(api_key=api_key)

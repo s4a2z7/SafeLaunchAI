@@ -3,9 +3,6 @@ import sys
 import os
 import time
 from typing import Dict, List, Optional
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # Set page configuration
 st.set_page_config(page_title="SafeLaunch AI - Advanced RAG", layout="wide")
@@ -15,13 +12,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'startup-legal-helper
 
 # Import Advanced Components
 try:
-    from core.legal_rag_advanced import search_legal_context as advanced_search
+    from core.legal_rag_advanced import search_legal_context as advanced_search, search_patent_context
     from core.solution_engine import SolutionEngine
     from core.agent_orchestrator import LegalAgentTeam
+    from core.secret_manager import secret_manager
     COMPONENTS_READY = True
 except ImportError as e:
     st.error(f"컴포넌트 로드 실패: {e}")
     COMPONENTS_READY = False
+    secret_manager = None
 
 # Custom CSS for "Advanced" Aesthetic (Glassmorphism + Dark/Light Hybrid)
 st.markdown("""
@@ -102,38 +101,28 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🔒 보안 및 API 설정")
     
-    # 보안 인식 기반 API 키 로드 (UI 입력 제거)
-    # Priority: 1. Streamlit Secrets, 2. OS Environment Variables
-    api_key = None
-    try:
-        if "ANTHROPIC_API_KEY" in st.secrets:
-            api_key = st.secrets["ANTHROPIC_API_KEY"]
+    # SecretManager를 통한 안전한 API 키 관리
+    if secret_manager:
+        status = secret_manager.get_status_message()
+        api_key = secret_manager.get_anthropic_key()
+        if api_key:
             os.environ["ANTHROPIC_API_KEY"] = api_key
-    except Exception:
-        # secrets.toml이 아예 없는 경우 에러 방지
-        pass
-
-    if not api_key and os.getenv("ANTHROPIC_API_KEY"):
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-
-    if api_key:
-        st.success("✅ 보안 연결 활성화 (Secrets/Env)")
-    else:
-        st.warning("⚠️ 에이전트 분석 비활성")
-        with st.expander("보안 설정 가이드"):
-            st.markdown("""
-            안전한 API 키 설정을 위해 다음 중 하나를 권장합니다:
-            
-            1. **Streamlit Secrets (권장)**:
-               `.streamlit/secrets.toml` 파일을 생성하고 아래 내용을 입력하세요:
-               ```toml
-               ANTHROPIC_API_KEY = "your_key_here"
-               ```
-            2. **OS 환경변수**:
-               시스템 환경변수에 `ANTHROPIC_API_KEY`를 추가하세요.
-            
-            *UI에 직접 입력하는 방식은 보안을 위해 제거되었습니다.*
-            """)
+            st.success(status["message"])
+            st.caption(f"📡 소스: {status['source']}")
+        else:
+            st.warning(status["message"])
+            with st.expander("🔑 보안 설정 가이드"):
+                st.markdown("""
+                **1. Streamlit Secrets (권장)**
+                `.streamlit/secrets.toml` 파일 생성 후 입력:
+                ```toml
+                ANTHROPIC_API_KEY = "your_key_here"
+                ```
+                **2. OS 환경변수 (Windows)**
+                시스템 속성 > 환경변수 > `ANTHROPIC_API_KEY` 추가
+                
+                *UI 직접 입력 방식은 보안을 위해 제거되었습니다.*
+                """)
     
     st.markdown("---")
     st.markdown("### 🛠️ 탑재 기술")
@@ -141,6 +130,7 @@ with st.sidebar:
     st.caption("• **Embedding**: ko-sroberta (Dense Vector)")
     st.caption("• **Orchestration**: Claude 3.5 Agent Team")
     st.caption("• **Strategy**: Pattern-based Design Around")
+    st.caption("• **Patent Analysis**: 특허/상표/영업비밀 특화 검색")
 
 # Initialize Session State
 if 'chat_history' not in st.session_state:
